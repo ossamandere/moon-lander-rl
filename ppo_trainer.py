@@ -122,7 +122,8 @@ class ActorCritic(nn.Module):
         )
         
         # Actor head - outputs log standard deviation of actions
-        self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+        #  self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+        self.actor_log_std = nn.Parameter(torch.ones(action_dim) * 0.5)  # Higher initial std
         
         # Critic head - outputs state value
         self.critic = nn.Sequential(
@@ -179,7 +180,9 @@ class ActorCritic(nn.Module):
         bounded_action = action.clone()
         
         # Thrust magnitude: sigmoid to [0, 1]
-        bounded_action[:, 0] = torch.sigmoid(action[:, 0])
+        # bounded_action[:, 0] = torch.sigmoid(action[:, 0])
+        bounded_action[:, 0] = torch.clamp(action[:, 0], 0.0, 1.0)  # Direct clamping
+        bounded_action[:, 1:] = torch.clamp(action[:, 1:], -1.0, 1.0)  # Direct clamping
         
         # Gimbal angles: tanh to [-1, 1]
         bounded_action[:, 1:] = torch.tanh(action[:, 1:])
@@ -246,6 +249,13 @@ class PPOAgent:
             value = value.cpu().numpy()
         
         self.actor_critic.train()
+
+        # Debug what actions are being chosen
+        if not deterministic and np.random.random() < 0.01:  # Debug 1% of actions
+            print(f"Raw action: {action}")
+            print(f"Action std: {self.actor_critic.actor_log_std.exp().detach().cpu().numpy()}")
+            print(f"Thrust: {action[0]:.3f}, Gimbal: [{action[1]:.3f}, {action[2]:.3f}]")
+            
         return action, log_prob, value
     
     def store_experience(self, state: np.ndarray, action: np.ndarray, 
@@ -390,6 +400,9 @@ class PPOTrainingManager:
         self.episode_lengths = []
         self.success_rate = []
         self.training_stats = []
+
+        # track recent performance
+        self.reward_window = collections.deque(maxlen=50)
     
     def collect_rollout(self) -> List[Dict[str, Any]]:
         """Collect rollout data"""
@@ -403,6 +416,20 @@ class PPOTrainingManager:
             episode_data = {'states': [], 'actions': [], 'rewards': [], 'done': False}
             
             while steps_collected < self.rollout_steps:
+                # force early exploration
+                # if steps_collected < 1000:  # First 1000 steps
+                #     if np.random.random() < 0.3:  # 30% random actions
+                #         action = np.array([
+                #             np.random.random() * 0.8,  # Random thrust
+                #             (np.random.random() - 0.5) * 0.4,  # Random gimbal
+                #             (np.random.random() - 0.5) * 0.4
+                #         ])
+                #         log_prob, value = 0.0, 0.0  # Dummy values for exploration
+                #     else:
+                #         action, log_prob, value = self.agent.select_action(state, deterministic=False)
+                # else:
+                #     action, log_prob, value = self.agent.select_action(state, deterministic=False)
+
                 # Select action
                 action, log_prob, value = self.agent.select_action(state, deterministic=False)
                 
@@ -469,12 +496,18 @@ class PPOTrainingManager:
             
             # Print progress
             if iteration % 5 == 0:
+                grad_norm = losses.get('gradient_norm', 0)
                 print(f"Iter {iteration:4d} | "
                       f"Episodes: {len(episodes_data):2d} | "
                       f"Avg Reward: {avg_reward:7.1f} | "
                       f"Avg Length: {avg_length:5.1f} | "
                       f"Success%: {current_success_rate:5.1%} | "
-                      f"Policy Loss: {losses.get('policy_loss', 0):6.3f}")
+                      f"Policy Loss: {losses.get('policy_loss', 0):6.3f} | "
+                      f"Grad Norm: {grad_norm:.4f}")
+
+                # learning rate diagnostic
+                if grad_norm < 1e-4:
+                    print("WARNING: very small gradient norms - increase learning rate")
             
             # Evaluation and saving
             if iteration % eval_interval == 0 and iteration > 0:
@@ -487,6 +520,17 @@ class PPOTrainingManager:
                 
                 print(f"Evaluation - Avg Reward: {avg_eval_reward:.1f}, "
                       f"Success Rate: {eval_results['success_rate']:.1%}")
+                
+            # Performance Stagnation Check
+            self.reward_window.extend(recent_rewards)
+
+            if len(self.reward_window) == 50 and iteration > 100:
+                early_rewards = list(self.reward_window)[:25]
+                late_rewards = list(self.reward_window)[25:]
+                improvement = np.mean(late_rewards) - np.mean(early_rewards)
+                if abs(improvement) < 10: # may need adjusting
+                    print(f"WARNING: Minimal improvement ({improvement:.1f}), learning rate too low")
+                
             
             if iteration % save_interval == 0 and iteration > 0:
                 self.agent.save(os.path.join(save_dir, f"ppo_agent_iter_{iteration}.pth"))
@@ -497,6 +541,16 @@ class PPOTrainingManager:
         print("PPO Training completed!")
         self.agent.save(os.path.join(save_dir, "final_ppo_agent.pth"))
         self.save_training_stats(os.path.join(save_dir, "final_ppo_training_stats.pkl"))
+
+        # Monitors policy loss trends to check learning rate
+        if iteration > 0 and iteration % 10 == 0:
+            recent_policy_losses = self.agent.policy_losses[-10:]
+            policy_loss_change = abs(recent_policy_losses[-1] - recent_policy_losses[0])
+            print(f"Policy loss change (last 10 iters): {policy_loss_change:.6f}")
+            
+            # Flag if change is too small
+            if policy_loss_change < 1e-5:
+                print("WARNING: Policy loss barely changing - learning rate might be too low")
     
     def evaluate(self, num_episodes: int = 10, render: bool = True) -> Dict[str, Any]:
         """Evaluate the trained agent"""

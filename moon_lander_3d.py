@@ -88,6 +88,8 @@ class MoonLander3D:
         thrust_fraction = np.clip(action[0], 0.0, 1.0)
         gimbal_x = np.clip(action[1], -1.0, 1.0) * self.MAX_GIMBAL_ANGLE
         gimbal_y = np.clip(action[2], -1.0, 1.0) * self.MAX_GIMBAL_ANGLE
+
+        self._last_thrust = thrust_fraction  # Track for reward
         
         # Calculate current mass and maximum thrust
         current_mass = self.DRY_MASS + self.fuel_mass
@@ -200,16 +202,20 @@ class MoonLander3D:
     def _calculate_shaped_reward(self, distance_to_target: float) -> float:
         """Calculate shaped reward for ongoing flight"""
         # Distance reward (closer to target is better)
-        distance_reward = -distance_to_target * 0.1
+        # distance_reward = -distance_to_target * 0.1
         
         # Velocity penalty (discourage excessive speed)
         velocity_magnitude = np.linalg.norm(self.velocity)
-        velocity_penalty = -velocity_magnitude * 0.01
+        # velocity_penalty = -velocity_magnitude * 0.01
+
+        # NEW (stronger signals):
+        distance_reward = -distance_to_target * 0.5  # Stronger distance penalty
+        velocity_penalty = -velocity_magnitude * 0.05  # Stronger velocity penalty
         
-        # Small step penalty to encourage efficiency
-        step_penalty = -0.1
+        # ADD thrust usage reward to encourage firing:
+        thrust_reward = 0.1 if hasattr(self, '_last_thrust') and self._last_thrust > 0.1 else 0
         
-        total_reward = distance_reward + velocity_penalty + step_penalty
+        total_reward = distance_reward + velocity_penalty + thrust_reward
         return total_reward
     
     def get_state_info(self) -> Dict[str, Any]:
